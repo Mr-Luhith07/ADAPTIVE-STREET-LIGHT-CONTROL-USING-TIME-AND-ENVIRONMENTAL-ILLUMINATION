@@ -1,0 +1,1442 @@
+#ifndef PROJECT_CONFIG_H
+#define PROJECT_CONFIG_H
+
+#define FOSC             12000000U
+#define CCLK             (FOSC * 5U)       /* 60 MHz */
+#define PCLK             (CCLK / 4U)       /* 15 MHz */
+
+#define PREINT_VAL       ((PCLK / 32768U) - 1U)
+#define PREFRAC_VAL      (PCLK - ((PREINT_VAL + 1U) * 32768U))
+
+#define RTC_RST          (1U << 1)
+#define RTC_ENB          (1U << 0)
+
+#define LIGHT_PIN        24U               /* P1.24 to P1.27 */
+#define LIGHT_MASK       (0x0FU << LIGHT_PIN)
+
+#define ADC_CHANNEL      1U                /* AD0.1 on P0.28 */
+#define LDR_DARK_WHEN_HIGH 1U
+#define LDR_DARK_THRESHOLD 650U
+#define LDR_BRIGHT_THRESHOLD 550U
+
+#define EINT0_CHANNEL    14U               /* VIC channel for EINT0 */
+
+#endif
+
+/* Main application: Adaptive Street Light Control.
+   MCU: LPC2148
+   Operation: RTC schedule active AND LDR darkness = lights ON.
+   The EINT0 push-button opens the RTC/settings menu. */
+
+#include <LPC214x.h>
+#include "types.h"
+#include "delay.h"
+#include "lcd.h"
+#include "lcd_defines.h"
+#include "kpm.h"
+#include "rtc.h"
+#include "ldr.h"
+#include "streetlight.h"
+#include "eint.h"
+#include "menu.h"
+
+int main(void)
+{
+    u32 hr, min, sec;
+    u32 date, month, year, day;
+
+    /* Initialize display, keypad, RTC, sensor and output drivers. */
+    InitLCD();
+	// To check if LCD is in working condition or not.
+	/*StrLCD("Working");
+	delay_ms(1000);
+	CmdLCD(CLEAR_LCD);*/
+
+    InitKPM();
+    RTC_Init();
+    LDR_Init();
+    StreetLight_Init();
+    EINT0_Init();
+
+    /* Initial RTC values; change these through the menu or your own setup. */
+    //RTC_SetTime(18U, 30U, 0U);
+    //RTC_SetDate(16U, 11U, 2026U);
+    RTC_SetDay(1U);
+
+    CmdLCD(CLEAR_LCD);
+    StrLCD("STREET LIGHT");
+    CmdLCD(GOTO_LINE2_POS0);
+    StrLCD("SYSTEM READY");
+    delay_ms(1000U);
+	CmdLCD(CLEAR_LCD);
+
+    while(1)
+    {
+        if(menuRequest != 0U)
+        {
+            menuRequest = 0U;
+            RTC_Edit_Menu();
+        }
+
+        RTC_GetTime(&hr, &min, &sec);
+        RTC_GetDate(&date, &month, &year);
+        RTC_GetDay(&day);
+
+        LDR_Read();
+        StreetLight_Control(hr, min);
+
+        /* Line 1: current RTC time. */
+        RTC_DisplayTime(hr, min, sec);
+		CmdLCD(GOTO_LINE1_POS0+10);
+		if(ldrInitialized && adcValid)
+        {
+            if(ldrDark)
+                StrLCD("D ");
+            else
+                StrLCD("B ");
+
+            U32LCD(ldrAdcValue);
+            StrLCD("   ");
+        }
+        else
+        {
+            StrLCD("LDR ERROR       ");
+        }
+		
+        /* Line 2: show Date, illumination state and ADC value. */
+		CmdLCD(GOTO_LINE1_POS0+12);
+		RTC_DisplayDay(day);
+
+        CmdLCD(GOTO_LINE2_POS0);
+		RTC_DisplayDate(date,month,year);
+		
+        delay_ms(200U);
+    }
+}
+
+#ifndef TYPES_H
+#define TYPES_H
+typedef unsigned int u32;
+typedef unsigned short int u16;
+typedef unsigned char u8;
+typedef int s32;
+typedef char s8;
+typedef float f32;
+#endif
+
+/* Delay routines for the LPC2148 project.
+   These are software delays; their accuracy depends on compiler settings
+   and generated machine code. Do not use them for precise timing. */
+
+#include "types.h"
+#include "delay.h"
+
+void delay_us(u32 dlyUS)
+{
+    volatile u32 count;
+    while(dlyUS--)
+    {
+        for(count = 12U; count > 0U; count--)
+        {
+            /* Intentional empty loop. volatile prevents removal. */
+        }
+    }
+}
+
+void delay_ms(u32 dlyMS)
+{
+    while(dlyMS--)
+        delay_us(1000U);
+}
+
+void delay_s(u32 dlyS)
+{
+    while(dlyS--)
+        delay_ms(1000U);
+}
+
+#ifndef DELAY_H
+#define DELAY_H
+#include "types.h"
+void delay_us(u32 dlyUS);
+void delay_ms(u32 dlyMS);
+void delay_s(u32 dlyS);
+#endif
+
+/* 8-bit LCD driver for an HD44780-compatible display.
+   Data bus: P0.8-P0.15; RS=P0.4; EN=P0.17; RW=P0.18. */
+
+#include <LPC214x.h>
+#include "types.h"
+#include "lcd.h"
+#include "lcd_defines.h"
+#include "delay.h"
+
+void WriteLCD(u8 dat)
+{
+    /* Clear the LCD data-bus bits, then place the new byte. */
+    IOCLR0 = (0xFFU << LCD_DATA);
+    IOSET0 = ((u32)dat << LCD_DATA);
+
+    IOCLR0 = (1U << LCD_RW);       /* Write operation */
+    IOSET0 = (1U << LCD_EN);       /* Enable pulse */
+    delay_us(1U);
+    IOCLR0 = (1U << LCD_EN);
+    delay_ms(2U);
+}
+
+void CmdLCD(u8 cmd)
+{
+    IOCLR0 = (1U << LCD_RS);       /* Command register */
+    WriteLCD(cmd);
+}
+
+void CharLCD(u8 asciiVal)
+{
+    IOSET0 = (1U << LCD_RS);       /* Data register */
+    WriteLCD(asciiVal);
+}
+
+void InitLCD(void)
+{
+    IODIR0 |= (0xFFU << LCD_DATA) |
+              (1U << LCD_RS) |
+              (1U << LCD_RW) |
+              (1U << LCD_EN);
+
+    delay_ms(20U);
+    CmdLCD(0x30);
+    delay_ms(5U);
+    CmdLCD(0x30);
+    delay_us(150U);
+    CmdLCD(0x30);
+    CmdLCD(MODE_8BIT_2LINE);
+    CmdLCD(DSP_ON_CUR_OFF);
+    CmdLCD(CLEAR_LCD);
+    CmdLCD(SHIFT_CUR_RIGHT);
+}
+
+void StrLCD(s8 *s)
+{
+    while(*s)
+        CharLCD((u8)*s++);
+}
+
+void U32LCD(u32 n)
+{
+    u8 digits[10];
+    s32 i = 0;
+
+    if(n == 0U)
+    {
+        CharLCD('0');
+        return;
+    }
+
+    while(n > 0U && i < 10)
+    {
+        digits[i++] = (u8)((n % 10U) + '0');
+        n /= 10U;
+    }
+
+    while(--i >= 0)
+        CharLCD(digits[i]);
+}
+
+void S32LCD(s32 n)
+{
+    if(n < 0)
+    {
+        CharLCD('-');
+        n = -n;
+    }
+    U32LCD((u32)n);
+}
+
+void F32LCD(f32 value, u8 nDP)
+{
+    u32 whole;
+    u8 i;
+
+    if(value < 0.0F)
+    {
+        CharLCD('-');
+        value = -value;
+    }
+
+    whole = (u32)value;
+    U32LCD(whole);
+    CharLCD('.');
+
+    value -= (f32)whole;
+    for(i = 0; i < nDP; i++)
+    {
+        value *= 10.0F;
+        whole = (u32)value;
+        CharLCD((u8)(whole + '0'));
+        value -= (f32)whole;
+    }
+}
+
+void BuildCGRAM(u8 *p, u8 nBytes)
+{
+    u8 i;
+    CmdLCD(GOTO_CGRAM_START);
+    IOSET0 = (1U << LCD_RS);
+
+    for(i = 0; i < nBytes; i++)
+        WriteLCD(p[i]);
+
+    CmdLCD(GOTO_LINE1_POS0);
+}
+
+#ifndef LCD_H
+#define LCD_H
+#include "types.h"
+void WriteLCD(u8 dat);
+void CmdLCD(u8 cmd);
+void CharLCD(u8 asciiVal);
+void InitLCD(void);
+void StrLCD(s8 *s);
+void U32LCD(u32 n);
+void S32LCD(s32 n);
+void F32LCD(f32 n, u8 nDP);
+void BuildCGRAM(u8 *p, u8 nBytes);
+#endif
+
+#ifndef LCD_DEFINES_H
+#define LCD_DEFINES_H
+
+#define CLEAR_LCD          0x01
+#define RET_CUR_HOME       0x02
+#define SHIFT_CUR_RIGHT    0x06
+#define SHIFT_CUR_LEFT     0x07
+#define DSP_OFF            0x08
+#define DSP_ON_CUR_OFF     0x0C
+#define DSP_ON_CUR_BLK     0x0E
+#define SHIFT_DSP_LEFT     0x10
+#define SHIFT_DSP_RIGHT    0x14
+#define MODE_8BIT_2LINE    0x38
+#define GOTO_LINE1_POS0    0x80
+#define GOTO_LINE2_POS0    0xC0
+#define GOTO_CGRAM_START   0x40
+
+/* LCD wiring:
+   D0-D7 = P0.8-P0.15
+   RS    = P0.4
+   EN    = P0.17
+   RW    = P0.18
+*/
+#define LCD_DATA 8U
+#define LCD_RS   4U
+#define LCD_EN   17U
+#define LCD_RW   18U
+
+#endif
+
+						   
+/********************************************************
+ MODULE  : MENU2.C
+ PROJECT : ADAPTIVE STREET LIGHT CONTROL
+ MCU     : LPC2129 / LPC2148
+
+ DESCRIPTION:
+ 1. EINT0 enters the RTC edit menu.
+ 2. Keypad digits enter values.
+ 3. C clears the entered value.
+ 4. x deletes the last digit.
+ 5. '=' accepts the entered value.
+ 6. Fixed digit limits are applied.
+ 7. BackgroundTasks() maintains streetlight operation.
+********************************************************/
+
+#include <LPC21xx.h>
+
+#include "types.h"
+#include "rtc.h"
+#include "lcd.h"
+#include "lcd_defines.h"
+#include "kpm.h"
+#include "delay.h"
+#include "ldr.h"
+#include "streetlight.h"
+#include "menu.h"
+
+
+/*======================================================
+                  GLOBAL VARIABLES
+======================================================*/
+
+static u32 hr, min, sec;
+
+
+/*======================================================
+                  BACKGROUND TASKS
+======================================================*/
+
+void BackgroundTasks(void)
+{
+    RTC_GetTime(&hr, &min, &sec);
+
+    LDR_Read();
+
+    StreetLight_Control(hr, min);
+}
+
+
+/*======================================================
+                  READ VALUE FROM KEYPAD
+
+ message   : LCD message
+ maxDigits : Maximum allowed digits
+======================================================*/
+
+static u32 ReadValue(s8 *message, u8 maxDigits)
+{
+    CmdLCD(CLEAR_LCD);
+    CmdLCD(GOTO_LINE1_POS0);
+
+    StrLCD(message);
+
+    return ReadNumWithService(maxDigits, BackgroundTasks);
+}
+
+
+/*======================================================
+             READ AND VALIDATE KEYPAD VALUE
+======================================================*/
+
+static u32 ReadValueInRange(s8 *message,
+                            u32 min_value,
+                            u32 max_value,
+                            u8 maxDigits)
+{
+    u32 value;
+
+    while(1)
+    {
+        value = ReadValue(message, maxDigits);
+
+        if(value >= min_value && value <= max_value)
+        {
+            return value;
+        }
+
+        CmdLCD(CLEAR_LCD);
+        CmdLCD(GOTO_LINE1_POS0);
+        StrLCD("INVALID VALUE");
+
+        delay_ms(700U);
+    }
+}
+
+
+/*======================================================
+                    EDIT RTC TIME
+======================================================*/
+
+static void EditTime(void)
+{
+    u32 h, m, s, choice;
+
+    RTC_GetTime(&h, &m, &s);
+
+    while(1)
+    {
+        BackgroundTasks();
+
+        CmdLCD(CLEAR_LCD);
+        CmdLCD(GOTO_LINE1_POS0);
+        StrLCD("1.HOUR 2.MINUTE");
+
+        CmdLCD(GOTO_LINE2_POS0);
+        StrLCD("3.SECOND 4.EXIT");
+
+        /* Menu selection: only one digit. */
+
+        choice = ReadNumWithService(1U, BackgroundTasks);
+
+        switch(choice)
+        {
+            case 1:
+
+                h = ReadValueInRange("SET HOUR 0-23",
+                                     0U, 23U, 2U);
+                break;
+
+            case 2:
+
+                m = ReadValueInRange("SET MIN 0-59",
+                                     0U, 59U, 2U);
+                break;
+
+            case 3:
+
+                s = ReadValueInRange("SET SEC 0-59",
+                                     0U, 59U, 2U);
+                break;
+
+            case 4:
+
+                CmdLCD(CLEAR_LCD);
+                StrLCD("EXIT T-MENU");
+
+                delay_ms(700U);
+
+                CmdLCD(CLEAR_LCD);
+                return;
+
+            default:
+
+                CmdLCD(CLEAR_LCD);
+                StrLCD("INVALID OPTION");
+
+                delay_ms(700U);
+                continue;
+        }
+
+        /* Preserve unmodified RTC values. */
+
+        RTC_SetTime(h, m, s);
+
+        CmdLCD(CLEAR_LCD);
+        CmdLCD(GOTO_LINE1_POS0);
+        StrLCD("TIME UPDATED");
+
+        delay_ms(700U);
+    }
+}
+
+
+/*======================================================
+                    EDIT RTC DATE
+======================================================*/
+
+static void EditDate(void)
+{
+    u32 d, m, y, dow, choice;
+
+    /* Read existing date and day. */
+
+    d   = DOM;
+    m   = MONTH;
+    y   = YEAR;
+    dow = DOW;
+
+    while(1)
+    {
+        BackgroundTasks();
+
+        CmdLCD(CLEAR_LCD);
+        CmdLCD(GOTO_LINE1_POS0);
+        StrLCD("1.Dt 2.MON 3.Yr");
+
+        CmdLCD(GOTO_LINE2_POS0);
+        StrLCD("4.DAY 5.EXIT");
+
+        /* Menu selection: one digit. */
+
+        choice = ReadNumWithService(1U, BackgroundTasks);
+
+        switch(choice)
+        {
+            case 1:
+
+                d = ReadValueInRange("SET DATE 1-31",
+                                     1U, 31U, 2U);
+                break;
+
+            case 2:
+
+                m = ReadValueInRange("SET MONTH 1-12",
+                                     1U, 12U, 2U);
+                break;
+
+            case 3:
+
+                y = ReadValueInRange("SET YEAR 1-4095",
+                                     1U, 4095U, 4U);
+                break;
+
+            case 4:
+
+                dow = ReadValueInRange("DAY 0SUN-6SAT",
+                                       0U, 6U, 1U);
+                break;
+
+            case 5:
+
+                /* Save only a valid complete date. */
+
+                if(d >= 1U && m >= 1U && m <= 12U &&
+                   y >= 1U && y <= 4095U &&
+                   d <= RTC_DaysInMonth(m, y) &&
+                   dow <= 6U)
+                {
+                    RTC_SetDate(d, m, y);
+                    RTC_SetDay(dow);
+                }
+
+                CmdLCD(CLEAR_LCD);
+                StrLCD("EXIT D-MENU");
+
+                delay_ms(700U);
+
+                CmdLCD(CLEAR_LCD);
+                return;
+
+            default:
+
+                CmdLCD(CLEAR_LCD);
+                StrLCD("INVALID OPTION");
+
+                delay_ms(700U);
+                continue;
+        }
+
+        /* Validate complete date before updating RTC. */
+
+        if(d >= 1U && m >= 1U && m <= 12U &&
+           y >= 1U && y <= 4095U &&
+           d <= RTC_DaysInMonth(m, y) &&
+           dow <= 6U)
+        {
+            RTC_SetDate(d, m, y);
+            RTC_SetDay(dow);
+
+            CmdLCD(CLEAR_LCD);
+            StrLCD("DATE UPDATED");
+        }
+        else
+        {
+            CmdLCD(CLEAR_LCD);
+            StrLCD("INVALID DATE");
+        }
+
+        delay_ms(700U);
+    }
+}
+
+
+/*======================================================
+              EDIT STREETLIGHT BOUNDARIES
+======================================================*/
+
+static void EditBoundaries(void)
+{
+    u32 sh, sm, eh, em, choice;
+
+    /* Read existing boundary values. */
+
+    sh = start_hour;
+    sm = start_min;
+
+    eh = end_hour;
+    em = end_min;
+
+    while(1)
+    {
+        BackgroundTasks();
+
+        CmdLCD(CLEAR_LCD);
+        CmdLCD(GOTO_LINE1_POS0);
+        StrLCD("1.S-H 2.S-M");
+
+        CmdLCD(GOTO_LINE2_POS0);
+        StrLCD("3.E-H 4.E-M 5.Ex");
+
+        /* Boundary menu: one digit only. */
+
+        choice = ReadNumWithService(1U, BackgroundTasks);
+
+        switch(choice)
+        {
+            case 1:
+
+                sh = ReadValueInRange("ON HOUR 0-23",
+                                      0U, 23U, 2U);
+                break;
+
+            case 2:
+
+                sm = ReadValueInRange("ON MIN 0-59",
+                                      0U, 59U, 2U);
+                break;
+
+            case 3:
+
+                eh = ReadValueInRange("OFF HOUR 0-23",
+                                      0U, 23U, 2U);
+                break;
+
+            case 4:
+
+                em = ReadValueInRange("OFF MIN 0-59",
+                                      0U, 59U, 2U);
+                break;
+
+            case 5:
+
+                CmdLCD(CLEAR_LCD);
+                StrLCD("EXIT B-MENU");
+
+                delay_ms(700U);
+
+                CmdLCD(CLEAR_LCD);
+                return;
+
+            default:
+
+                CmdLCD(CLEAR_LCD);
+                StrLCD("INVALID OPTION");
+
+                delay_ms(700U);
+                continue;
+        }
+
+        /* Validate all boundary values. */
+
+        if(sh <= 23U && eh <= 23U &&
+           sm <= 59U && em <= 59U &&
+           ((sh * 60U + sm) != (eh * 60U + em)))
+        {
+            start_hour = sh;
+            start_min  = sm;
+
+            end_hour = eh;
+            end_min  = em;
+
+            CmdLCD(CLEAR_LCD);
+            StrLCD("BOUNDARY SAVED");
+        }
+        else
+        {
+            CmdLCD(CLEAR_LCD);
+            StrLCD("INVALID BOUNDARY");
+        }
+
+        delay_ms(700U);
+    }
+}
+
+
+/*======================================================
+                  MAIN RTC EDIT MENU
+======================================================*/
+
+void RTC_Edit_Menu(void)
+{
+    u32 choice;
+
+    while(1)
+    {
+        BackgroundTasks();
+
+        CmdLCD(CLEAR_LCD);
+        CmdLCD(GOTO_LINE1_POS0);
+        StrLCD("1.TIME 2.DATE");
+
+        CmdLCD(GOTO_LINE2_POS0);
+        StrLCD("3.BOUND 4.EXIT");
+
+        /* Main menu: maximum one digit. */
+
+        choice = ReadNumWithService(1U, BackgroundTasks);
+
+        switch(choice)
+        {
+            case 1:
+
+                EditTime();
+                break;
+
+            case 2:
+
+                EditDate();
+                break;
+
+            case 3:
+
+                EditBoundaries();
+                break;
+
+            case 4:
+
+                CmdLCD(CLEAR_LCD);
+                StrLCD("EXIT MENU");
+
+                delay_ms(700U);
+
+                CmdLCD(CLEAR_LCD);
+                return;
+
+            default:
+
+                CmdLCD(CLEAR_LCD);
+                StrLCD("INVALID OPTION");
+
+                delay_ms(700U);
+                break;
+        }
+    }
+}
+
+#ifndef MENU_H
+#define MENU_H
+void RTC_Edit_Menu(void);
+void BackgroundTasks(void);
+#endif
+
+/* External interrupt 0 driver.
+   LPC2148 EINT0 is selected on P0.1 using PINSEL0 bits 2:3.
+   Connect the menu push-button circuit to P0.1. */
+
+#include <LPC214x.h>
+#include "eint.h"
+
+#define EINT0_VIC_CHANNEL 14U
+
+volatile unsigned int menuRequest = 0U;
+
+void EINT0_ISR(void) __irq
+{
+    menuRequest = 1U;
+    EXTINT = 1U;             /* Clear EINT0 flag */
+    VICVectAddr = 0U;        /* End of interrupt */
+}
+
+void EINT0_Init(void)
+{
+    PINSEL0 &= ~(3U << 2);
+    PINSEL0 |=  (3U << 2);   /* P0.1 function 11 = EINT0 */
+
+    EXTMODE |= 1U;           /* Edge-sensitive */
+    EXTPOLAR &= ~1U;         /* Falling edge */
+    EXTINT = 1U;             /* Clear pending EINT0 */
+
+    VICIntSelect &= ~(1U << EINT0_VIC_CHANNEL);
+    VICVectAddr0 = (unsigned long)EINT0_ISR;
+    VICVectCntl0 = (1U << 5) | EINT0_VIC_CHANNEL;
+    VICIntEnable = (1U << EINT0_VIC_CHANNEL);
+}
+
+#ifndef EINT_H
+#define EINT_H
+extern volatile unsigned int menuRequest;
+void EINT0_Init(void);
+#endif
+
+/* 4x4 matrix keypad driver.
+   Rows: P1.16-P1.19 (outputs); columns: P1.20-P1.23 (inputs).
+   The key map uses digits, C=clear, and '=' as the enter key. */
+
+#include <LPC214x.h>
+#include "types.h"
+#include "kpm.h"
+#include "kpm_defines.h"
+#include "lcd.h"
+#include "lcd_defines.h"
+#include "delay.h"
+
+static const u8 KpmLUT[4][4] =
+{
+    {'1','2','3','/'},
+    {'4','5','6','x'},
+    {'7','8','9','-'},
+    {'C','0','=','+'}
+};
+
+void InitKPM(void)
+{
+    /* Rows are outputs; columns are inputs. */
+    IODIR1 |=  (0x0FU << ROW0);
+    IODIR1 &= ~(0x0FU << COL0);
+    IOCLR1 = (0x0FU << ROW0);
+}
+
+u8 ColScan(void)
+{
+    u32 mask = (1U << COL0) | (1U << COL1) |
+               (1U << COL2) | (1U << COL3);
+    return ((IOPIN1 & mask) == mask) ? 1U : 0U;
+}
+
+u8 RowCheck(void)
+{
+    u8 r = 0xFFU;
+
+    IOCLR1 = (1U << ROW0);
+    IOSET1 = (1U << ROW1) | (1U << ROW2) |
+             (1U << ROW3);
+
+    if(ColScan() == 0U)
+        r = 0U;
+
+    else
+    {
+        IOSET1 = (1U << ROW0);
+        IOCLR1 = (1U << ROW1);
+        IOSET1 = (1U << ROW2) | (1U << ROW3);
+
+        if(ColScan() == 0U)
+            r = 1U;
+
+        else
+        {
+            IOSET1 = (1U << ROW0) | (1U << ROW1);
+            IOCLR1 = (1U << ROW2);
+            IOSET1 = (1U << ROW3);
+
+            if(ColScan() == 0U)
+                r = 2U;
+
+            else
+            {
+                IOSET1 = (1U << ROW0) |
+                         (1U << ROW1) |
+                         (1U << ROW2);
+
+                IOCLR1 = (1U << ROW3);
+
+                if(ColScan() == 0U)
+                    r = 3U;
+            }
+        }
+    }
+
+    /* Do not reset rows here.
+       ColCheck() must identify the pressed column first. */
+
+    return r;
+}
+
+
+u8 ColCheck(void)
+{
+    if((IOPIN1 & (1U << COL0)) == 0U) return 0U;
+    if((IOPIN1 & (1U << COL1)) == 0U) return 1U;
+    if((IOPIN1 & (1U << COL2)) == 0U) return 2U;
+    if((IOPIN1 & (1U << COL3)) == 0U) return 3U;
+    return 0xFFU;
+}
+
+/* READBIT is kept local to this driver to avoid a dependency on defines.h. */
+
+u8 KeyScan_NB(void)
+{
+    static u8 keyReady = 1U;
+
+    u8 row, col, key;
+
+    if(ColScan() != 0U)
+    {
+        keyReady = 1U;
+        return 0U;
+    }
+
+    if(keyReady == 0U)
+        return 0U;
+
+    delay_ms(20U);
+
+    if(ColScan() != 0U)
+    {
+        keyReady = 1U;
+        return 0U;
+    }
+
+    row = RowCheck();
+
+    if(row > 3U)
+    {
+        IOCLR1 = (0x0FU << ROW0);
+        return 0U;
+    }
+
+    col = ColCheck();
+
+    /* Restore the idle row condition. */
+
+    IOCLR1 = (0x0FU << ROW0);
+
+    if(col > 3U)
+        return 0U;
+
+    key = KpmLUT[row][col];
+
+    keyReady = 0U;
+
+    return key;
+}
+
+
+/*=====================================================
+       READ NUMBER WITH FIXED DIGIT LIMIT
+
+       maxDigits = Maximum number of digits allowed
+       service   = Background task function pointer
+
+       C = Clear
+       x = Backspace
+       = = Accept
+=====================================================*/
+
+u32 ReadNumWithService(u8 maxDigits, void (*service)(void))
+{
+    u32 value = 0U;
+    u8 key;
+    u8 digitCount = 0U;
+
+    /* Clear only the second LCD line.
+       First line contains the message/menu. */
+
+    /*CmdLCD(GOTO_LINE2_POS0);
+    StrLCD("                ");
+    CmdLCD(GOTO_LINE2_POS0);  */
+	CmdLCD(GOTO_LINE1_POS0);
+
+    while(1)
+    {
+        /* Execute background operations. */
+
+        if(service != 0)
+            service();
+
+        key = KeyScan_NB();
+
+        if(key == 0U)
+        {
+            delay_ms(10U);
+            continue;
+        }
+
+        /*--------------------------------
+                NUMERIC KEY PRESSED
+        --------------------------------*/
+
+        if(key >= '0' && key <= '9')
+        {
+            /* Accept digits only within the limit. */
+
+            if(digitCount < maxDigits)
+            {
+                value = (value * 10U) +
+                        (u32)(key - '0');
+
+                digitCount++;
+
+                /*CmdLCD(GOTO_LINE2_POS0);
+                StrLCD("                ");
+                CmdLCD(GOTO_LINE2_POS0); */
+				CmdLCD(CLEAR_LCD);
+                U32LCD(value);
+            }
+        }
+
+        /*--------------------------------
+                    BACKSPACE
+        --------------------------------*/
+
+        else if(key == 'x')
+        {
+            if(digitCount > 0U)
+            {
+                value = value / 10U;
+                digitCount--;
+
+                CmdLCD(GOTO_LINE1_POS0);
+                StrLCD("                ");
+                CmdLCD(GOTO_LINE1_POS0);
+				//StrLCD("     ");
+                if(digitCount > 0U)
+                    U32LCD(value);
+            }
+        }
+
+        /*--------------------------------
+                     CLEAR
+        --------------------------------*/
+
+        else if(key == 'C')
+        {
+            value = 0U;
+            digitCount = 0U;
+
+            CmdLCD(GOTO_LINE1_POS0);
+            StrLCD("                ");
+            CmdLCD(GOTO_LINE1_POS0);
+        }
+
+        /*--------------------------------
+                     ACCEPT
+        --------------------------------*/
+
+        else if(key == '=')
+        {
+            return value;
+        }
+    }
+}
+
+#ifndef KPM_H
+#define KPM_H
+#include "types.h"
+void InitKPM(void);
+u8 ColScan(void);
+u8 RowCheck(void);
+u8 ColCheck(void);
+u8 KeyScan_NB(void);
+u32 ReadNumWithService1(void (*service)(void));
+u32 ReadNumWithService(u8 maxDigits,void (*service)(void));
+
+#endif
+
+#ifndef KPM_DEFINES_H
+#define KPM_DEFINES_H
+#define ROW0 16U       /* P1.16 */
+#define ROW1 17U       /* P1.17 */
+#define ROW2 18U       /* P1.18 */
+#define ROW3 19U       /* P1.19 */
+#define COL0 20U       /* P1.20 */
+#define COL1 21U       /* P1.21 */
+#define COL2 22U       /* P1.22 */
+#define COL3 23U       /* P1.23 */
+#endif
+
+/* LDR application layer.
+   Reads AD0.1 and applies hysteresis to avoid rapid switching near
+   the threshold. Adjust thresholds after observing real ADC readings. */
+
+#include "types.h"
+#include "project_config.h"
+#include "adc.h"
+#include "ldr.h"
+
+u16 ldrAdcValue = 0U;
+f32 ldrVoltage = 0.0F;
+u8 adcValid = 0U;
+u8 ldrDark = 0U;
+u8 ldrInitialized = 0U;
+
+void LDR_Init(void)
+{
+    Init_ADC();
+}
+
+void LDR_Read(void)
+{
+    adcValid = Read_ADC(ADC_CHANNEL, &ldrAdcValue, &ldrVoltage);
+
+    if(adcValid)
+    {
+#if LDR_DARK_WHEN_HIGH
+        if(ldrAdcValue >= LDR_DARK_THRESHOLD)
+            ldrDark = 1U;
+        else if(ldrAdcValue <= LDR_BRIGHT_THRESHOLD)
+            ldrDark = 0U;
+#else
+        if(ldrAdcValue <= LDR_BRIGHT_THRESHOLD)
+            ldrDark = 1U;
+        else if(ldrAdcValue >= LDR_DARK_THRESHOLD)
+            ldrDark = 0U;
+#endif
+        ldrInitialized = 1U;
+    }
+}
+
+#ifndef LDR_H
+#define LDR_H
+#include "types.h"
+extern u16 ldrAdcValue;
+extern f32 ldrVoltage;
+extern u8 adcValid;
+extern u8 ldrDark;
+extern u8 ldrInitialized;
+void LDR_Init(void);
+void LDR_Read(void);
+#endif
+
+/* LPC2148 ADC0 driver.
+   AD0.1 is available on P0.28. ADC clock is configured for 3 MHz
+   assuming PCLK=15 MHz. */
+
+#include <LPC214x.h>
+#include "types.h"
+#include "adc.h"
+#include "adc_defines.h"
+
+void Init_ADC(void)
+{
+    PINSEL1 &= ~(3U << 24);
+    PINSEL1 |=  (1U << 24);       /* P0.28 = AD0.1 */
+
+    AD0CR = (ADC_CLKDIV << 8) | (1U << ADC_PDN_BIT);
+}
+
+u8 Read_ADC(u8 chNo, u16 *dVal, f32 *eAR)
+{
+    u32 timeout;
+    u32 result;
+
+    if(chNo > 7U || dVal == 0 || eAR == 0)
+        return 0U;
+
+    AD0CR = (1U << chNo) |
+            (ADC_CLKDIV << 8) |
+            (1U << ADC_PDN_BIT);
+
+    AD0CR &= ~(7U << ADC_START_BIT);
+    AD0CR |=  (1U << ADC_START_BIT);
+
+    timeout = ADC_TIMEOUT;
+    while(((AD0GDR & (1U << ADC_DONE_BIT)) == 0U) && timeout > 0U)
+        timeout--;
+
+    if(timeout == 0U)
+    {
+        AD0CR &= ~(7U << ADC_START_BIT);
+        return 0U;
+    }
+
+    result = (AD0GDR >> ADC_RESULT_SHIFT) & ADC_RESULT_MASK;
+    *dVal = (u16)result;
+    *eAR = ((f32)result * ADC_VREF) / 1023.0F;
+
+    AD0CR &= ~(7U << ADC_START_BIT);
+    return 1U;
+}
+
+#ifndef ADC_H
+#define ADC_H
+#include "types.h"
+void Init_ADC(void);
+u8 Read_ADC(u8 chNo, u16 *dVal, f32 *eAR);
+#endif
+
+#ifndef ADC_DEFINES_H
+#define ADC_DEFINES_H
+#define ADC_CLK             3000000U
+#define ADC_PCLK            15000000U
+#define ADC_CLKDIV          ((ADC_PCLK / ADC_CLK) - 1U)
+#define ADC_PDN_BIT         21U
+#define ADC_START_BIT       24U
+#define ADC_DONE_BIT        31U
+#define ADC_RESULT_SHIFT    6U
+#define ADC_RESULT_MASK     0x3FFU
+#define ADC_VREF            3.3F
+#define ADC_TIMEOUT         100000U
+#endif
+
+/* RTC driver for LPC2148.
+   Uses the 32.768 kHz RTC clock and a PCLK of 15 MHz. */
+
+#include <LPC214x.h>
+#include "types.h"
+#include "project_config.h"
+#include "rtc.h"
+#include "lcd.h"
+#include "lcd_defines.h"
+
+void RTC_Init(void)
+{
+    //CCR = RTC_RST;
+	CCR=1<<4;
+    PREINT = PREINT_VAL;
+    PREFRAC = PREFRAC_VAL;
+    //CCR = RTC_ENB;
+	//CCR = 0x11;
+	CCR=1<<0 | 1<<4;
+	/*if((CCR & 0x01)==0)
+	{	CCR=1<<1;
+		CCR=1<<0 | 1<<4;
+	}
+	else
+		CCR=1<<4;*/
+}
+
+void RTC_SetTime(u32 h, u32 m, u32 s)
+{
+    HOUR = h;
+    MIN = m;
+    SEC = s;
+}
+
+void RTC_SetDate(u32 d, u32 m, u32 y)
+{
+    DOM = d;
+    MONTH = m;
+    YEAR = y;
+}
+
+void RTC_SetDay(u32 day)
+{
+    DOW = day;
+}
+
+void RTC_GetTime(u32 *h, u32 *m, u32 *s)
+{
+    *h = HOUR;
+    *m = MIN;
+    *s = SEC;
+}
+
+void RTC_GetDate(u32 *d, u32 *m, u32 *y)
+{
+    *d = DOM;
+    *m = MONTH;
+    *y = YEAR;
+}
+
+void RTC_GetDay(u32 *day)
+{
+    *day = DOW;
+}
+
+u8 RTC_IsLeapYear(u32 year)
+{
+    if((year % 400U) == 0U) return 1U;
+    if((year % 100U) == 0U) return 0U;
+    if((year % 4U) == 0U) return 1U;
+    return 0U;
+}
+
+u8 RTC_DaysInMonth(u32 month, u32 year)
+{
+    switch(month)
+    {
+        case 1: case 3: case 5: case 7: case 8: case 10: case 12:
+            return 31U;
+        case 4: case 6: case 9: case 11:
+            return 30U;
+        case 2:
+            return RTC_IsLeapYear(year) ? 29U : 28U;
+        default:
+            return 0U;
+    }
+}
+
+void RTC_DisplayTime(u32 h, u32 m, u32 s)
+{
+    CmdLCD(GOTO_LINE1_POS0);
+    CharLCD((u8)((h / 10U) + '0'));
+    CharLCD((u8)((h % 10U) + '0'));
+    CharLCD(':');
+    CharLCD((u8)((m / 10U) + '0'));
+    CharLCD((u8)((m % 10U) + '0'));
+    CharLCD(':');
+    CharLCD((u8)((s / 10U) + '0'));
+    CharLCD((u8)((s % 10U) + '0'));
+}
+
+void RTC_DisplayDate(u32 d, u32 m, u32 y)
+{
+    CmdLCD(GOTO_LINE2_POS0);
+    CharLCD((u8)((d / 10U) + '0'));
+    CharLCD((u8)((d % 10U) + '0'));
+    CharLCD('/');
+    CharLCD((u8)((m / 10U) + '0'));
+    CharLCD((u8)((m % 10U) + '0'));
+    CharLCD('/');
+    U32LCD(y);
+}
+void RTC_DisplayDay(u32 day)
+{	CmdLCD(GOTO_LINE2_POS0+12);
+	
+	switch(day)	
+	{	case 0:StrLCD("SUN");
+				break;
+		case 1:StrLCD("MON");
+				break;
+		case 2:StrLCD("TUE");
+				break;
+		case 3:StrLCD("WED");
+				break;
+		case 4:StrLCD("THU");
+				break;
+		case 5:StrLCD("FRI");
+				break;
+		case 6:StrLCD("SAT");
+				break;
+		default:StrLCD("INVALID DAY");
+				break;
+	}
+}
+
+#ifndef RTC_H
+#define RTC_H
+#include "types.h"
+void RTC_Init(void);
+void RTC_SetTime(u32 h, u32 m, u32 s);
+void RTC_SetDate(u32 d, u32 m, u32 y);
+void RTC_SetDay(u32 day);
+void RTC_GetTime(u32 *h, u32 *m, u32 *s);
+void RTC_GetDate(u32 *d, u32 *m, u32 *y);
+void RTC_GetDay(u32 *day);
+u8 RTC_IsLeapYear(u32 year);
+u8 RTC_DaysInMonth(u32 month, u32 year);
+void RTC_DisplayTime(u32 h, u32 m, u32 s);
+void RTC_DisplayDate(u32 d, u32 m, u32 y); 
+void RTC_DisplayDay(u32 day);
+#endif
+
+/* Streetlight decision module.
+   Project rule: lights ON only when the RTC schedule is active AND
+   the LDR reports darkness. ADC failure defaults to lights OFF. */
+
+#include <LPC214x.h>
+#include "types.h"
+#include "project_config.h"
+#include "streetlight.h"
+#include "ldr.h"
+
+u32 start_hour = 18U;
+u32 start_min  = 30U;
+u32 end_hour   = 6U;
+u32 end_min    = 0U;
+
+void StreetLight_Init(void)
+{
+    /* P1.24-P1.27 selected as GPIO using PINSEL2. */
+    PINSEL2 &= ~(0xFFU << 16);
+    IODIR1 |= LIGHT_MASK;
+    IOCLR1 = LIGHT_MASK;
+}
+
+u8 StreetLight_IsScheduled(u32 hour, u32 minute)
+{
+    u32 now = (hour * 60U) + minute;
+    u32 start = (start_hour * 60U) + start_min;
+    u32 end = (end_hour * 60U) + end_min;
+
+    if(start == end)
+        return 0U;                   /* Equal boundaries = disabled */
+
+    if(start > end)
+        return ((now >= start) || (now < end)) ? 1U : 0U;
+
+    return ((now >= start) && (now < end)) ? 1U : 0U;
+}
+
+void StreetLight_Control(u32 hour, u32 minute)
+{
+    if(adcValid && ldrInitialized &&
+       StreetLight_IsScheduled(hour, minute) && ldrDark)
+    {
+        IOSET1 = LIGHT_MASK;
+    }
+    else
+    {
+        IOCLR1 = LIGHT_MASK;
+    }
+}
+
+#ifndef STREETLIGHT_H
+#define STREETLIGHT_H
+#include "types.h"
+extern u32 start_hour, start_min, end_hour, end_min;
+u8 StreetLight_IsScheduled(u32 hour, u32 minute);
+void StreetLight_Init(void);
+void StreetLight_Control(u32 hour, u32 minute);
+#endif
+
+
